@@ -63,6 +63,9 @@ texture_path_ext = ".t3x"
 tex3ds_enabled = True
 gw_rom_include_dir = "GW_ROM"
 
+# When false, we still generate textures + ROM pack, but do not write any C++ headers/sources.
+WRITE_EMBEDDED_FILES = True
+
 default_alpha_bright = 1.7
 default_fond_bright = 1.35
 default_rotate = False
@@ -120,12 +123,21 @@ def _round_up_to_one_of(value: int, candidates: Iterable[int]) -> int:
     return ordered[-1] if ordered else value
 
 
-def apply_profile(target_name: str, out_gfx: str | None, out_gw_all: str | None, out_gw_rom_dir: str | None, dpi_override: int | None, scale_override: int | None):
+def apply_profile(
+    target_name: str,
+    out_gfx: str | None,
+    out_gw_all: str | None,
+    out_gw_rom_dir: str | None,
+    dpi_override: int | None,
+    scale_override: int | None,
+    no_embedded: bool,
+):
     global destination_file, destination_game_file, destination_graphique_file
     global resolution_up, resolution_down, demi_resolution_up
     global size_altas_check, console_atlas_size, console_size
     global export_dpi, size_scale, background_atlas_sizes
     global texture_path_prefix, texture_path_ext, tex3ds_enabled, gw_rom_include_dir
+    global WRITE_EMBEDDED_FILES
 
     profile = get_target(target_name)
 
@@ -145,15 +157,48 @@ def apply_profile(target_name: str, out_gfx: str | None, out_gw_all: str | None,
     if size_scale <= 0:
         size_scale = int(profile.size_scale)
 
-    if out_gw_all is not None:
-        destination_file = out_gw_all
-    else:
-        destination_file = r"..\source\std\GW_ALL.h" if profile.name == "3ds" else r"..\source\std\GW_ALL_rgds.h"
+    # If we override size_scale for a hi-res pack, the console overlay must be
+    # scaled to match. Android divides console draw size by g_segment_info[2]
+    # (size_scale), so leaving the console at base resolution would make it
+    # appear too small.
+    if size_scale != int(profile.size_scale):
+        base = int(profile.size_scale) if int(profile.size_scale) > 0 else 1
+        # Use integer math to keep deterministic pixel sizes.
+        console_size = [int(console_size[0] * size_scale / base), int(console_size[1] * size_scale / base)]
+        console_atlas_size = [int(console_atlas_size[0] * size_scale / base), int(console_atlas_size[1] * size_scale / base)]
 
-    if out_gw_rom_dir is not None:
-        destination_game_file = out_gw_rom_dir
+    # When generating hi-res RGDS Android packs (rgds --hires), allow larger
+    # packing atlas candidates. The default RGDS profile caps at 2048 which can
+    # be insufficient at higher scales.
+    if target_name == "rgds" and size_scale == 2:
+        for v in (4096, 8192):
+            if v not in size_altas_check:
+                size_altas_check.append(v)
+            if v not in background_atlas_sizes:
+                background_atlas_sizes.append(v)
+        size_altas_check = sorted(set(int(x) for x in size_altas_check))
+        background_atlas_sizes = sorted(set(int(x) for x in background_atlas_sizes))
+
+    # Default behavior:
+    # - 3ds/rgds: generate embedded outputs + pack
+    # - pack-only builds can be requested via --no-embedded (or via rgds --hires convenience).
+    WRITE_EMBEDDED_FILES = not bool(no_embedded)
+
+    if WRITE_EMBEDDED_FILES:
+        if out_gw_all is not None:
+            destination_file = out_gw_all
+        else:
+            destination_file = r"..\source\std\GW_ALL.h" if profile.name == "3ds" else r"..\source\std\GW_ALL_rgds.h"
     else:
-        destination_game_file = r"..\source\std\GW_ROM" if profile.name == "3ds" else r"..\source\std\GW_ROM_RGDS"
+        destination_file = ""
+
+    if WRITE_EMBEDDED_FILES:
+        if out_gw_rom_dir is not None:
+            destination_game_file = out_gw_rom_dir
+        else:
+            destination_game_file = r"..\source\std\GW_ROM" if profile.name == "3ds" else r"..\source\std\GW_ROM_RGDS"
+    else:
+        destination_game_file = ""
 
     if profile.name == "3ds":
         texture_path_prefix = "romfs:/gfx/"
@@ -170,7 +215,10 @@ def apply_profile(target_name: str, out_gfx: str | None, out_gw_all: str | None,
     if out_gfx is not None:
         destination_graphique_file = out_gfx
     else:
-        destination_graphique_file = "../gfx/" if profile.name == "3ds" else "../gfx2x/"
+        if profile.name == "3ds":
+            destination_graphique_file = "../gfx/"
+        else:
+            destination_graphique_file = "../gfx2x/"
 
 def sort_by_screen(name: str):
     img_screen_sort = []
@@ -223,14 +271,17 @@ def find_best_parquet(rects: list):
     candidates.sort(key=lambda wh: wh[0] * wh[1])
 
     for w, h in candidates:
+        # rectpack is sensitive to call ordering in some versions.
+        # Add bins first, then rects, then pack.
         packer = newPacker(rotation=False)
+        packer.add_bin(w, h)
         for rect in rects:
             packer.add_rect(*rect)
-        packer.add_bin(w, h)
         packer.pack()
-        abin = next(iter(packer))
-        used_rects = len(list(abin))
-        if used_rects == len(rects):
+
+        # Count placed rectangles across all bins.
+        # rect_list() returns only successfully packed rects.
+        if len(packer.rect_list()) == len(rects):
             return packer, (w, h)
 
     return None, None
@@ -273,8 +324,17 @@ def visual_data_file(name, size_list, background_path_list, rotate = False, mask
             all_img.append([filename, img_r, i, x_size_max-pos_x-img_r.size[0], pos_y, img_r.size[0], img_r.size[1]])
         i += 1
 
-    packer, atlas_size = find_best_parquet(rects)            
-    im.save_packed_img(packer, all_img, atlas_size, pad, destination_graphique_file, name)        
+    packer, atlas_size = find_best_parquet(rects)
+    if packer is None or atlas_size is None:
+        max_w = max((r[0] for r in rects), default=0)
+        max_h = max((r[1] for r in rects), default=0)
+        raise RuntimeError(
+            f"Failed to pack segment atlas for '{name}' with {len(rects)} rects. "
+            f"Largest rect incl padding: {max_w}x{max_h}. "
+            f"Atlas candidates: {sorted(set(int(x) for x in size_altas_check))}"
+        )
+
+    im.save_packed_img(packer, all_img, atlas_size, pad, destination_graphique_file, name)
     with open(destination_graphique_file + 'segment_' + name + '.t3s', "w", encoding="utf-8") as f:
         if tex3ds_enabled:
             if(mask):
@@ -291,7 +351,10 @@ def visual_data_file(name, size_list, background_path_list, rotate = False, mask
     int_mask = 0
     if(mask): int_mask = 1 # first byte
     if(two_in_one_screen) : int_mask += 2 # second byte
-    seg_info_ints: list[int] = [int(atlas_size[0]), int(atlas_size[1]), 1, int(int_mask)]
+    # segment_info[2] is a scale divisor used by Android/RGDS renderer.
+    # Keep it at 1 for legacy targets, but allow higher-resolution packs to
+    # render at the same logical size by setting it to size_scale.
+    seg_info_ints: list[int] = [int(atlas_size[0]), int(atlas_size[1]), int(size_scale), int(int_mask)]
 
     for src in screen_size:
         seg_info_ints.extend([int(src[0]), int(src[1])])
@@ -429,23 +492,46 @@ def visual_console_data(name, path_console):
                                          , rotate_90 = False, miror = True
                                          , new_ratio = 0, cut = [x_cut, y_cut], add_SHARPEN = False)
     img = np.array(img)
-    img_f = np.zeros((console_atlas_size[1], console_atlas_size[0], 4), dtype=np.uint8)
-    img_f[0:img.shape[0], 0:img.shape[1], :] = img
-    Image.fromarray(img_f, mode="RGBA").save(destination_graphique_file + 'console_' + name + '.png')
-    with open(destination_graphique_file + 'console_' + name + '.t3s', "w", encoding="utf-8") as f:
-        if tex3ds_enabled:
+
+    out_png = destination_graphique_file + 'console_' + name + '.png'
+    out_t3s = destination_graphique_file + 'console_' + name + '.t3s'
+
+    if tex3ds_enabled:
+        # 3DS pipeline uses a fixed-size atlas for texture conversion.
+        img_f = np.zeros((console_atlas_size[1], console_atlas_size[0], 4), dtype=np.uint8)
+        img_f[0:img.shape[0], 0:img.shape[1], :] = img
+        Image.fromarray(img_f, mode="RGBA").save(out_png)
+        with open(out_t3s, "w", encoding="utf-8") as f:
             f.write("-f RGB8 -z none\n" + 'console_' + name + '.png')
-        else:
+
+        pos_y = console_atlas_size[1] - img.shape[0]
+        tex_w = int(console_atlas_size[0])
+        tex_h = int(console_atlas_size[1])
+        u = 0
+        v = int(pos_y)
+        w = int(img.shape[1])
+        h = int(img.shape[0])
+    else:
+        # Android/RGDS runtime loads PNGs directly; don't pad to a large atlas.
+        Image.fromarray(img, mode="RGBA").save(out_png)
+        with open(out_t3s, "w", encoding="utf-8") as f:
             f.write("")
-    pos_y = console_atlas_size[1]-img.shape[0]
+
+        tex_w = int(img.shape[1])
+        tex_h = int(img.shape[0])
+        u = 0
+        v = 0
+        w = int(img.shape[1])
+        h = int(img.shape[0])
+
     result = f'\nconst std::string path_console_{name} = "{texture_path_prefix}console_{name}{texture_path_ext}";\n'
     console_info_ints: list[int] = [
-        int(console_atlas_size[0]),
-        int(console_atlas_size[1]),
-        0,
-        int(pos_y),
-        int(img.shape[1]),
-        int(img.shape[0]),
+        int(tex_w),
+        int(tex_h),
+        int(u),
+        int(v),
+        int(w),
+        int(h),
     ]
     result += f"const uint16_t console_info_{name}[] = {{ " + ", ".join(str(i) for i in console_info_ints) + "}; \n\n"
 
@@ -494,9 +580,12 @@ def generate_game_file(destination_game_file, name, display_name, ref, date
                 , background_in_front = False, camera = False, manufacturer = MANUFACTURER_NINTENDO
                 , background_keep_white: bool = False
                 , background_white_keep_threshold: int = 245
+                , write_embedded_files: bool = True
                 ):
-    
-    c_file = f"""
+
+    c_file = ""
+    if write_embedded_files:
+        c_file = f"""
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -506,14 +595,15 @@ def generate_game_file(destination_game_file, name, display_name, ref, date
 #include "{name}.h"
 
 """
-    c_file += rom_text(name, rom_path)    
-    c_file += melody_text(name, melody_path)
+        c_file += rom_text(name, rom_path)
+        c_file += melody_text(name, melody_path)
     
     cs.extract_group_segs(visual_path, "./tmp/img/"+name, INKSCAPE_PATH, export_dpi=export_dpi)
     text, new_size_screen, seg_info_ints, segment_records = visual_data_file(
         name, size_visual, background_path, rotate, mask, color_segment, two_in_one_screen, transform
     )
-    c_file += text
+    if write_embedded_files:
+        c_file += text
     
     size_background = []
     for s in new_size_screen: size_background.append([int(s[0]), int(s[1])])
@@ -533,12 +623,15 @@ def generate_game_file(destination_game_file, name, display_name, ref, date
         background_keep_white,
         background_white_keep_threshold,
     )
-    c_file += bg_text
+    if write_embedded_files:
+        c_file += bg_text
     
     cs_text, console_info_ints = visual_console_data(name, path_console)
-    c_file += cs_text
+    if write_embedded_files:
+        c_file += cs_text
     
-    c_file += "\n\n"
+    if write_embedded_files:
+        c_file += "\n\n"
     
     manufacturer_id = _manufacturer_to_id(manufacturer)
     if manufacturer_id == MANUFACTURER_TRONICA:
@@ -548,7 +641,8 @@ def generate_game_file(destination_game_file, name, display_name, ref, date
     else:
         manufacturer_cpp = "GW_rom::MANUFACTURER_NINTENDO"
 
-    c_file += f'''
+    if write_embedded_files:
+        c_file += f'''
 const GW_rom {name} (
     "{display_name}", "{ref}", "{date}"
     , rom_GW_{name}, size_rom_GW_{name}
@@ -563,18 +657,18 @@ const GW_rom {name} (
     , {manufacturer_cpp}
 );
 
-'''   
-    with open(destination_game_file+"\\"+name+".cpp", "w") as f: f.write(c_file)
-    
-    # generate h file
-    c_file = f"""
+'''
+        with open(destination_game_file+"\\"+name+".cpp", "w") as f: f.write(c_file)
+
+        # generate h file
+        c_file = f"""
 #pragma once
 #include "GW_ROM.h"
 
 extern const GW_rom {name};
 
-"""    
-    with open(destination_game_file+"\\"+name+".h", "w") as f: f.write(c_file)
+"""
+        with open(destination_game_file+"\\"+name+".h", "w") as f: f.write(c_file)
 
     # Pack metadata (used to generate yokoi_pack_<target>.ykp)
     return {
@@ -754,6 +848,7 @@ def process_single_game(args):
         manufacturer,
         background_keep_white,
         background_white_keep_threshold,
+        write_embedded_files=WRITE_EMBEDDED_FILES,
     )
 
     wrote_cache = game_cache.write_game_cache(key, game_data, pack_meta)
@@ -980,6 +1075,11 @@ if __name__ == "__main__":
         help="Target profile (e.g. '3ds' or 'rgds').",
     )
     parser.add_argument(
+        "--no-embedded",
+        action="store_true",
+        help="Do not write embedded GW_ALL/GW_ROM C++ outputs; only generate textures + .ykp rompack.",
+    )
+    parser.add_argument(
         "--out-gfx",
         default=None,
         help="Output folder for generated PNG/T3S (default depends on target).",
@@ -1001,10 +1101,9 @@ if __name__ == "__main__":
         help="Override Inkscape export DPI (default depends on target).",
     )
     parser.add_argument(
-        "--scale",
-        type=int,
-        default=None,
-        help="Override size scale multiplier (default depends on target).",
+        "--hires",
+        action="store_true",
+        help="RGDS only: build the hi-res Android pack (pack-only, outputs to ../gfx3x/ by default).",
     )
     parser.add_argument(
         "--game",
@@ -1050,7 +1149,21 @@ if __name__ == "__main__":
 
     print(f"\n=== convert_3ds.py target: {args.target} ===\n")
 
-    apply_profile(args.target, args.out_gfx, args.out_gw_all, args.out_gw_rom_dir, args.export_dpi, args.scale)
+    # Validate --hires usage.
+    if args.hires:
+        if args.target != "rgds":
+            parser.error("--hires is only supported for target 'rgds'")
+
+        # Pack-only to avoid generating embedded headers/sources that won't match the embedded build.
+        args.no_embedded = True
+
+        # Default gfx output folder so hires assets don't overwrite normal RGDS outputs.
+        if args.out_gfx is None:
+            # Keep legacy naming used by the Android loader/assets.
+            args.out_gfx = "../gfx3x/"
+
+    scale_override = 2 if (args.target == "rgds" and bool(args.hires)) else None
+    apply_profile(args.target, args.out_gfx, args.out_gw_all, args.out_gw_rom_dir, args.export_dpi, scale_override, args.no_embedded)
 
     # Always enable cache *writing* so rebuilt games produce fresh cache files.
     # Cache *reading* (skip rebuilds) is controlled separately by --use-cache.
@@ -1071,6 +1184,7 @@ if __name__ == "__main__":
         texture_path_ext=texture_path_ext,
         destination_game_file=destination_game_file,
         destination_graphique_file=destination_graphique_file,
+        write_embedded_files=WRITE_EMBEDDED_FILES,
         default_console=default_console,
         default_alpha_bright=default_alpha_bright,
         default_fond_bright=default_fond_bright,
@@ -1081,7 +1195,8 @@ if __name__ == "__main__":
     games_path = _load_games_path_for_target(args.target)
     games_path = clean_games_path(games_path)
 
-    os.makedirs(destination_game_file, exist_ok=True)
+    if WRITE_EMBEDDED_FILES:
+        os.makedirs(destination_game_file, exist_ok=True)
     os.makedirs(destination_graphique_file, exist_ok=True)
 
     # Toggle to control processing mode
@@ -1182,7 +1297,7 @@ if __name__ == "__main__":
                     result = process_single_game(item)
                     results.append(result)
                 except Exception as game_error:
-                    print(f"Error processing {item[0]}: {game_error}")
+                    print(f"Error processing {item[0]} ({type(game_error).__name__}): {game_error}")
                     continue
     else:
         # Sequential processing (default)
@@ -1196,15 +1311,23 @@ if __name__ == "__main__":
                 result = process_single_game(item)
                 results.append(result)
             except Exception as game_error:
-                print(f"Error processing {item[0]}: {game_error}")
+                print(f"Error processing {item[0]} ({type(game_error).__name__}): {game_error}")
                 continue
 
-    generate_global_file(games_path, destination_file)
+    if WRITE_EMBEDDED_FILES:
+        generate_global_file(games_path, destination_file)
 
     # Always write a pack for the selected target.
     script_dir = Path(__file__).resolve().parent
-    canonical_pack_path = script_dir / f"yokoi_pack_{args.target}.ykp"
-    versioned_pack_path = script_dir / f"yokoi_pack_{args.target}_v{ROMPACK_FORMAT_VERSION}.{ROMPACK_CONTENT_VERSION}.ykp"
+
+    # Avoid overwriting the default rgds pack when using --hires.
+    pack_name = args.target
+    if args.target == "rgds" and bool(args.hires):
+        # Keep legacy pack naming.
+        pack_name = "rgds3x"
+
+    canonical_pack_path = script_dir / f"yokoi_pack_{pack_name}.ykp"
+    versioned_pack_path = script_dir / f"yokoi_pack_{pack_name}_v{ROMPACK_FORMAT_VERSION}.{ROMPACK_CONTENT_VERSION}.ykp"
 
     # Target-specific defaults.
     platform_id = 0

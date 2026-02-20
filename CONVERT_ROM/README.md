@@ -20,9 +20,7 @@ If you are looking for how to build the apps themselves, see [BUILDING.md](/BUIL
   - [Build assets, roms, graphics and rompacks](#build-assets-roms-graphics-and-rompacks)
     - [3DS](#3ds)
     - [Android (RGDS)](#android-rgds)
-      - [Additional notes](#additional-notes)
-  - [Advanced script descriptions and options](#advanced-script-descriptions-and-options)
-    - [`convert_original.py`](#convert_originalpy)
+    - [Android (rompack-only hi-res)](#android-rompack-only-hi-res)
     - [`convert_3ds.py`](#convert_3dspy)
   - [External ROM pack](#external-rom-pack)
     - [Rom pack locations](#rom-pack-locations)
@@ -120,6 +118,19 @@ Outputs:
 - External rompack written into `CONVERT_ROM/` as `yokoi_pack_rgds.ykp` and `yokoi_pack_rgds_vX.X.ykp`.
     - Both files are identical, but one includes versioning for convenience.
 
+### Android (rompack-only hi-res)
+
+Build optional higher-resolution Android/RGDS-compatible rompack.
+
+This workflow is **pack-only** and does **not** generate embedded-build C++ outputs (`GW_ALL*.h`, `GW_ROM_*/<game>.cpp/.h`).
+
+```powershell
+cd CONVERT_ROM
+python convert_original.py --target rgds
+python convert_3ds.py --target rgds --hires
+
+This writes `yokoi_pack_rgds3x.ykp` and does not generate embedded C++ outputs.
+
 #### Additional notes
 
 - Rompacks are versioned, so if there are changes to the format you will need to build a new rompack
@@ -160,7 +171,7 @@ python convert_original.py --target rgds
 
 Takes the prepared raw MAME assets (ROMs, PNG backgrounds, SVG visuals, `games_path.py`) and converts them into both assets for an embedded build and the rompack data.
 
-The script supports two main targets: `3ds` and `rgds`.
+The script supports `3ds` and `rgds`.
 
 Typical usage:
 

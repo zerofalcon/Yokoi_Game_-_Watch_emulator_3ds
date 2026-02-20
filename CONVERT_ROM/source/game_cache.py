@@ -49,6 +49,7 @@ def configure(
     texture_path_ext: str,
     destination_game_file: str,
     destination_graphique_file: str,
+    write_embedded_files: bool,
     default_console: str,
     default_alpha_bright: float,
     default_fond_bright: float,
@@ -77,6 +78,7 @@ def configure(
         "texture_path_ext": str(texture_path_ext),
         "destination_game_file": str(destination_game_file),
         "destination_graphique_file": str(destination_graphique_file),
+        "write_embedded_files": bool(write_embedded_files),
         "default_console": str(default_console),
         "default_alpha_bright": float(default_alpha_bright),
         "default_fond_bright": float(default_fond_bright),
@@ -191,7 +193,8 @@ def write_game_cache(key: str, game_data: dict, pack_meta: dict) -> Path | None:
 
 def _cache_file_for_game(key: str) -> Path:
     safe_key = str(key)
-    return _cache_dir / f"gamecache_{_target_name}_{safe_key}.json"
+    scale = int(_context.get("size_scale", 1) or 1)
+    return _cache_dir / f"gamecache_{_target_name}_{scale}x_{safe_key}.json"
 
 
 def _file_digest(path: str) -> str:
@@ -315,10 +318,12 @@ def _build_game_signature_and_hints(key: str, game_data: dict, *, prev_hints: di
 
 
 def _expected_outputs_exist_for_game(key: str, game_data: dict) -> bool:
-    out_cpp = os.path.join(str(_context.get("destination_game_file", "")), f"{key}.cpp")
-    out_h = os.path.join(str(_context.get("destination_game_file", "")), f"{key}.h")
-    if not (os.path.exists(out_cpp) and os.path.exists(out_h)):
-        return False
+    write_embedded = bool(_context.get("write_embedded_files", True))
+    if write_embedded:
+        out_cpp = os.path.join(str(_context.get("destination_game_file", "")), f"{key}.cpp")
+        out_h = os.path.join(str(_context.get("destination_game_file", "")), f"{key}.h")
+        if not (os.path.exists(out_cpp) and os.path.exists(out_h)):
+            return False
 
     gfx_dir = str(_context.get("destination_graphique_file", ""))
     seg_png = os.path.join(gfx_dir, f"segment_{key}.png")
@@ -395,8 +400,10 @@ def _describe_missing_outputs_for_game(key: str, game_data: dict) -> list[str]:
     out_dir = str(_context.get("destination_game_file", ""))
     gfx_dir = str(_context.get("destination_graphique_file", ""))
 
-    check(os.path.join(out_dir, f"{key}.cpp"))
-    check(os.path.join(out_dir, f"{key}.h"))
+    write_embedded = bool(_context.get("write_embedded_files", True))
+    if write_embedded:
+        check(os.path.join(out_dir, f"{key}.cpp"))
+        check(os.path.join(out_dir, f"{key}.h"))
 
     check(os.path.join(gfx_dir, f"segment_{key}.png"))
     check(os.path.join(gfx_dir, f"segment_{key}.t3s"))
